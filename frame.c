@@ -1,7 +1,7 @@
 /*
 	frame: Heap of routines dealing with the core mpg123 data structure.
 
-	copyright 2008-9 by the mpg123 project - free software under the terms of the LGPL 2.1
+	copyright 2008-2010 by the mpg123 project - free software under the terms of the LGPL 2.1
 	see COPYING and AUTHORS files in distribution or http://mpg123.org
 	initially written by Thomas Orgis
 */
@@ -14,11 +14,26 @@ static void frame_fixed_reset(mpg123_handle *fr);
 
 /* that's doubled in decode_ntom.c */
 #define NTOM_MUL (32768)
-#define aligned_pointer(p,type,alignment) \
-	(((char*)(p)-(char*)NULL) % (alignment)) \
-	? (type*)((char*)(p) + (alignment) - (((char*)(p)-(char*)NULL) % (alignment))) \
-	: (type*)(p)
-void frame_default_pars(mpg123_pars *mp)
+
+#define aligned_pointer(p, type, alignment) align_the_pointer(p, alignment)
+static void *align_the_pointer(void *base, unsigned int alignment)
+{
+	/*
+		Work in unsigned integer realm, explicitly.
+		Tricking the compiler into integer operations like % by invoking base-NULL is dangerous: It results into ptrdiff_t, which gets negative on big addresses. Big screw up, that.
+		I try to do it "properly" here: Casting only to uintptr_t and no artihmethic with void*.
+	*/
+	uintptr_t baseval = (uintptr_t)(char*)base;
+	uintptr_t aoff = baseval % alignment;
+
+	debug3("align_the_pointer: pointer %p is off by %u from %u",
+	       base, (unsigned int)aoff, alignment);
+
+	if(aoff) return (char*)base+alignment-aoff;
+	else     return base;
+}
+
+static void frame_default_pars(mpg123_pars *mp)
 {
 	mp->outscale = 1.0;
 #ifdef GAPLESS
@@ -37,88 +52,22 @@ void frame_default_pars(mpg123_pars *mp)
 #ifndef NO_ICY
 	mp->icy_interval = 0;
 #endif
-#ifndef WIN32
 	mp->timeout = 0;
-#endif
 	mp->resync_limit = 1024;
 #ifdef FRAME_INDEX
 	mp->index_size = INDEX_SIZE;
 #endif
 	mp->preframes = 4; /* That's good  for layer 3 ISO compliance bitstream. */
 	mpg123_fmt_all(mp);
+	/* Default of keeping some 4K buffers at hand, should cover the "usual" use case (using 16K pipe buffers as role model). */
+	mp->feedpool = 5; 
+	mp->feedbuffer = 4096;
 }
 
 void frame_init(mpg123_handle *fr)
 {
 	frame_init_par(fr, NULL);
 }
-
-#ifdef OPT_DITHER
-static void dither_table_init(float *dithertable)
-{
-	int32_t i;
-	uint32_t seed = 2463534242UL;
-	float input_noise;
-	float xv[9], yv[9];
-	union
-	{
-		uint32_t i;
-		float f;
-	} dither_noise;
-	
-	for(i=0;i<9;i++)
-	{
-		xv[i] = yv[i] = 0.0f;
-	}
-	
-	for(i=0;i<DITHERSIZE;i++)
-	{
-		/* generate 1st pseudo-random number (xorshift32) */
-		seed ^= (seed<<13);
-		seed ^= (seed>>17);
-		seed ^= (seed<<5);
-		
-		/* scale the number to [-0.5, 0.5] */
-#ifdef IEEE_FLOAT
-		dither_noise.i = (seed>>9)|0x3f800000;
-		dither_noise.f -= 1.5f;
-#else
-		dither_noise.f = (double)seed / 4294967295.0;
-		dither_noise.f -= 0.5f;
-#endif
-		
-		input_noise = dither_noise.f;
-		
-		/* generate 2nd pseudo-random number, to make a TPDF distribution */
-		seed ^= (seed<<13);
-		seed ^= (seed>>17);
-		seed ^= (seed<<5);
-		
-		/* scale the number to [-0.5, 0.5] */
-#ifdef IEEE_FLOAT
-		dither_noise.i = (seed>>9)|0x3f800000;
-		dither_noise.f -= 1.5f;
-#else
-		dither_noise.f = (double)seed / 4294967295.0;
-		dither_noise.f -= 0.5f;
-#endif
-		
-		input_noise += dither_noise.f;
-		
-		/* apply 8th order Chebyshev high-pass IIR filter */
-		xv[0] = xv[1]; xv[1] = xv[2]; xv[2] = xv[3]; xv[3] = xv[4]; xv[4] = xv[5]; xv[5] = xv[6]; xv[6] = xv[7]; xv[7] = xv[8]; 
-		xv[8] = input_noise / 1.046605543e+07;
-		yv[0] = yv[1]; yv[1] = yv[2]; yv[2] = yv[3]; yv[3] = yv[4]; yv[4] = yv[5]; yv[5] = yv[6]; yv[6] = yv[7]; yv[7] = yv[8]; 
-		yv[8] = (xv[0] + xv[8]) - 8 * (xv[1] + xv[7]) + 28 * (xv[2] + xv[6])
-				- 56 * (xv[3] + xv[5]) + 70 * xv[4]
-				+ ( -0.6610337226 * yv[0]) + ( -5.2856836445 * yv[1])
-				+ (-18.7646200370 * yv[2]) + (-38.6287198220 * yv[3])
-				+ (-50.4388759960 * yv[4]) + (-42.7846655830 * yv[5])
-				+ (-23.0310886710 * yv[6]) + ( -7.1965249172 * yv[7]);
-		dithertable[i] = yv[8] * 3.0f;
-	}
-}
-#endif
 
 void frame_init_par(mpg123_handle *fr, mpg123_pars *mp)
 {
@@ -131,6 +80,10 @@ void frame_init_par(mpg123_handle *fr, mpg123_pars *mp)
 #ifndef NO_8BIT
 	fr->conv16to8_buf = NULL;
 #endif
+#ifdef OPT_DITHER
+	fr->dithernoise = NULL;
+#endif
+	fr->layerscratch = NULL;
 	fr->xing_toc = NULL;
 	fr->cpu_opts.type = defdec();
 	fr->cpu_opts.class = decclass(fr->cpu_opts.type);
@@ -150,10 +103,18 @@ void frame_init_par(mpg123_handle *fr, mpg123_pars *mp)
 	invalidate_format(&fr->af);
 	fr->rdat.r_read = NULL;
 	fr->rdat.r_lseek = NULL;
+	fr->rdat.iohandle = NULL;
+	fr->rdat.r_read_handle = NULL;
+	fr->rdat.r_lseek_handle = NULL;
+	fr->rdat.cleanup_handle = NULL;
+	fr->wrapperdata = NULL;
+	fr->wrapperclean = NULL;
 	fr->decoder_change = 1;
 	fr->err = MPG123_OK;
 	if(mp == NULL) frame_default_pars(&fr->p);
 	else memcpy(&fr->p, mp, sizeof(struct mpg123_pars_struct));
+
+	bc_prepare(&fr->rdat.buffer, fr->p.feedpool, fr->p.feedbuffer);
 
 	fr->down_sample = 0; /* Initialize to silence harmless errors when debugging. */
 	frame_fixed_reset(fr); /* Reset only the fixed data, dynamic buffers are not there yet! */
@@ -164,11 +125,24 @@ void frame_init_par(mpg123_handle *fr, mpg123_pars *mp)
 	fi_init(&fr->index);
 	frame_index_setup(fr); /* Apply the size setting. */
 #endif
-#ifdef OPT_DITHER
-	/* run-time dither noise table generation */
-	dither_table_init(fr->dithernoise);
-#endif
 }
+
+#ifdef OPT_DITHER
+/* Also, only allocate the memory for the table on demand.
+   In future, one could create special noise for different sampling frequencies(?). */
+int frame_dither_init(mpg123_handle *fr)
+{
+	/* run-time dither noise table generation */
+	if(fr->dithernoise == NULL)
+	{
+		fr->dithernoise = malloc(sizeof(float)*DITHERSIZE);
+		if(fr->dithernoise == NULL) return 0;
+
+		dither_table_init(fr->dithernoise);
+	}
+	return 1;
+}
+#endif
 
 mpg123_pars attribute_align_arg *mpg123_new_pars(int *error)
 {
@@ -378,6 +352,51 @@ int frame_buffers(mpg123_handle *fr)
 #endif
 #endif
 	}
+
+	/* Layer scratch buffers are of compile-time fixed size, so allocate only once. */
+	if(fr->layerscratch == NULL)
+	{
+		/* Allocate specific layer1/2/3 buffers, so that we know they'll work for SSE. */
+		size_t scratchsize = 0;
+		real *scratcher;
+#ifndef NO_LAYER1
+		scratchsize += sizeof(real) * 2 * SBLIMIT;
+#endif
+#ifndef NO_LAYER2
+		scratchsize += sizeof(real) * 2 * 4 * SBLIMIT;
+#endif
+#ifndef NO_LAYER3
+		scratchsize += sizeof(real) * 2 * SBLIMIT * SSLIMIT; /* hybrid_in */
+		scratchsize += sizeof(real) * 2 * SSLIMIT * SBLIMIT; /* hybrid_out */
+#endif
+		/*
+			Now figure out correct alignment:
+			We need 16 byte minimum, smallest unit of the blocks is 2*SBLIMIT*sizeof(real), which is 64*4=256. Let's do 64bytes as heuristic for cache line (as proven useful in buffs above).
+		*/
+		fr->layerscratch = malloc(scratchsize+63);
+		if(fr->layerscratch == NULL) return -1;
+
+		/* Get aligned part of the memory, then divide it up. */
+		scratcher = aligned_pointer(fr->layerscratch,real,64);
+		/* Those funky pointer casts silence compilers...
+		   One might change the code at hand to really just use 1D arrays, but in practice, that would not make a (positive) difference. */
+#ifndef NO_LAYER1
+		fr->layer1.fraction = (real(*)[SBLIMIT])scratcher;
+		scratcher += 2 * SBLIMIT;
+#endif
+#ifndef NO_LAYER2
+		fr->layer2.fraction = (real(*)[4][SBLIMIT])scratcher;
+		scratcher += 2 * 4 * SBLIMIT;
+#endif
+#ifndef NO_LAYER3
+		fr->layer3.hybrid_in = (real(*)[SBLIMIT][SSLIMIT])scratcher;
+		scratcher += 2 * SBLIMIT * SSLIMIT;
+		fr->layer3.hybrid_out = (real(*)[SSLIMIT][SBLIMIT])scratcher;
+		scratcher += 2 * SSLIMIT * SBLIMIT;
+#endif
+		/* Note: These buffers don't need resetting here. */
+	}
+
 	/* Only reset the buffers we created just now. */
 	frame_decode_buffers_reset(fr);
 
@@ -401,7 +420,7 @@ int frame_buffers_reset(mpg123_handle *fr)
 	return 0;
 }
 
-void frame_icy_reset(mpg123_handle* fr)
+static void frame_icy_reset(mpg123_handle* fr)
 {
 #ifndef NO_ICY
 	if(fr->icy.data != NULL) free(fr->icy.data);
@@ -411,7 +430,7 @@ void frame_icy_reset(mpg123_handle* fr)
 #endif
 }
 
-void frame_free_toc(mpg123_handle *fr)
+static void frame_free_toc(mpg123_handle *fr)
 {
 	if(fr->xing_toc != NULL){ free(fr->xing_toc); fr->xing_toc = NULL; }
 }
@@ -512,7 +531,7 @@ static void frame_fixed_reset(mpg123_handle *fr)
 	fr->freeformat_framesize = -1;
 }
 
-void frame_free_buffers(mpg123_handle *fr)
+static void frame_free_buffers(mpg123_handle *fr)
 {
 	if(fr->rawbuffs != NULL) free(fr->rawbuffs);
 	fr->rawbuffs = NULL;
@@ -524,6 +543,7 @@ void frame_free_buffers(mpg123_handle *fr)
 	if(fr->conv16to8_buf != NULL) free(fr->conv16to8_buf);
 	fr->conv16to8_buf = NULL;
 #endif
+	if(fr->layerscratch != NULL) free(fr->layerscratch);
 }
 
 void frame_exit(mpg123_handle *fr)
@@ -539,8 +559,22 @@ void frame_exit(mpg123_handle *fr)
 #ifdef FRAME_INDEX
 	fi_exit(&fr->index);
 #endif
+#ifdef OPT_DITHER
+	if(fr->dithernoise != NULL)
+	{
+		free(fr->dithernoise);
+		fr->dithernoise = NULL;
+	}
+#endif
 	exit_id3(fr);
 	clear_icy(&fr->icy);
+	/* Clean up possible mess from LFS wrapper. */
+	if(fr->wrapperclean != NULL)
+	{
+		fr->wrapperclean(fr->wrapperdata);
+		fr->wrapperdata = NULL;
+	}
+	bc_cleanup(&fr->rdat.buffer);
 }
 
 int attribute_align_arg mpg123_info(mpg123_handle *mh, struct mpg123_frameinfo *mi)
@@ -576,6 +610,17 @@ int attribute_align_arg mpg123_info(mpg123_handle *mh, struct mpg123_frameinfo *
 	return MPG123_OK;
 }
 
+int attribute_align_arg mpg123_framedata(mpg123_handle *mh, unsigned long *header, unsigned char **bodydata, size_t *bodybytes)
+{
+	if(mh == NULL)     return MPG123_ERR;
+	if(!mh->to_decode) return MPG123_ERR;
+
+	if(header    != NULL) *header    = mh->oldhead;
+	if(bodydata  != NULL) *bodydata  = mh->bsbuf;
+	if(bodybytes != NULL) *bodybytes = mh->framesize;
+
+	return MPG123_OK;
+}
 
 /*
 	Fuzzy frame offset searching (guessing).
@@ -585,7 +630,7 @@ int attribute_align_arg mpg123_info(mpg123_handle *mh, struct mpg123_frameinfo *
 		- guess wildly from mean framesize and offset of first frame / beginning of file.
 */
 
-off_t frame_fuzzy_find(mpg123_handle *fr, off_t want_frame, off_t* get_frame)
+static off_t frame_fuzzy_find(mpg123_handle *fr, off_t want_frame, off_t* get_frame)
 {
 	/* Default is to go to the beginning. */
 	off_t ret = fr->audio_start;
@@ -718,6 +763,28 @@ off_t frame_outs(mpg123_handle *fr, off_t num)
 	return outs;
 }
 
+/* Compute the number of output samples we expect from this frame.
+   This is either simple spf() or a tad more elaborate for ntom. */
+off_t frame_expect_outsamples(mpg123_handle *fr)
+{
+	off_t outs = 0;
+	switch(fr->down_sample)
+	{
+		case 0:
+#		ifndef NO_DOWNSAMPLE
+		case 1:
+		case 2:
+#		endif
+			outs = spf(fr)>>fr->down_sample;
+		break;
+#ifndef NO_NTOM
+		case 3: outs = ntom_frame_outsamples(fr); break;
+#endif
+		default: error1("Bad down_sample (%i) ... should not be possible!!", fr->down_sample);
+	}
+	return outs;
+}
+
 off_t frame_offset(mpg123_handle *fr, off_t outs)
 {
 	off_t num = 0;
@@ -768,7 +835,11 @@ void frame_gapless_update(mpg123_handle *fr, off_t total_samples)
 	else if(fr->end_s > total_samples)
 	{
 		if(NOQUIET) error2("end sample count smaller than gapless end! (%"OFF_P" < %"OFF_P").", (off_p)total_samples, (off_p)fr->end_s);
-		fr->end_s = total_samples;
+		/* Humbly disabling gapless stuff on track end. */
+		fr->end_s = 0;
+		frame_gapless_realinit(fr);
+		fr->lastframe = -1;
+		fr->lastoff = 0;
 	}
 }
 
@@ -848,6 +919,8 @@ void frame_set_seek(mpg123_handle *fr, off_t sp)
 	debug3("frame_set_seek: begin at %li frames, end at %li; ignore from %li",
 	       (long) fr->firstframe, (long) fr->lastframe, (long) fr->ignoreframe);
 #endif
+	/* Old bit reservoir should be invalid, eh? */
+	fr->bitreservoir = 0;
 }
 
 int attribute_align_arg mpg123_volume_change(mpg123_handle *mh, double change)

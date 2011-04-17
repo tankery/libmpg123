@@ -1,7 +1,7 @@
 /*
-	leyer3.c: the layer 3 decoder
+	layer3.c: the layer 3 decoder
 
-	copyright 1995-2008 by the mpg123 project - free software under the terms of the LGPL 2.1
+	copyright 1995-2009 by the mpg123 project - free software under the terms of the LGPL 2.1
 	see COPYING and AUTHORS files in distribution or http://mpg123.org
 	initially written by Michael Hipp
 
@@ -56,9 +56,9 @@ struct gr_info_s
 	unsigned block_type;
 	unsigned mixed_block_flag;
 	unsigned table_select[3];
-	unsigned subblock_gain[3];
-	unsigned maxband[3];
-	unsigned maxbandl;
+	/* Making those two signed int as workaround for open64/pathscale/sun compilers, and also for consistency, since they're worked on together with other signed variables. */
+	int maxband[3];
+	int maxbandl;
 	unsigned maxb;
 	unsigned region1start;
 	unsigned region2start;
@@ -86,7 +86,7 @@ struct bandInfoStruct
 };
 
 /* Techy details about our friendly MPEG data. Fairly constant over the years;-) */
-const struct bandInfoStruct bandInfo[9] =
+static const struct bandInfoStruct bandInfo[9] =
 {
 	{ /* MPEG 1.0 */
 		{0,4,8,12,16,20,24,30,36,44,52,62,74, 90,110,134,162,196,238,288,342,418,576},
@@ -451,7 +451,7 @@ static int III_get_side_info(mpg123_handle *fr, struct III_sideinfo *si,int ster
 		gr_info->big_values = getbits(fr, 9);
 		if(gr_info->big_values > 288)
 		{
-			error("big_values too large!");
+			if(NOQUIET) error("big_values too large!");
 			gr_info->big_values = 288;
 		}
 		gr_info->pow2gain = fr->gainpow2+256 - getbits_fast(fr, 8) + powdiff;
@@ -476,7 +476,7 @@ static int III_get_side_info(mpg123_handle *fr, struct III_sideinfo *si,int ster
 
 			if(gr_info->block_type == 0)
 			{
-				error("Blocktype == 0 and window-switching == 1 not allowed.");
+				if(NOQUIET) error("Blocktype == 0 and window-switching == 1 not allowed.");
 				return 1;
 			}
 
@@ -494,6 +494,7 @@ static int III_get_side_info(mpg123_handle *fr, struct III_sideinfo *si,int ster
 					if((gr_info->block_type == 2) && (!gr_info->mixed_block_flag) ) r0c = 5;
 					else r0c = 7;
 
+					/* r0c+1+r1c+1 == 22, always. */
 					r1c = 20 - r0c;
 					gr_info->region1start = bandInfo[sfreq].longIdx[r0c+1] >> 1 ;
 					gr_info->region2start = bandInfo[sfreq].longIdx[r0c+1+r1c+1] >> 1; 
@@ -511,12 +512,12 @@ static int III_get_side_info(mpg123_handle *fr, struct III_sideinfo *si,int ster
 			for (i=0; i<3; i++)
 			gr_info->table_select[i] = getbits_fast(fr, 5);
 
-			r0c = getbits_fast(fr, 4);
-			r1c = getbits_fast(fr, 3);
+			r0c = getbits_fast(fr, 4); /* 0 .. 15 */
+			r1c = getbits_fast(fr, 3); /* 0 .. 7 */
 			gr_info->region1start = bandInfo[sfreq].longIdx[r0c+1] >> 1 ;
-			gr_info->region2start = bandInfo[sfreq].longIdx[r0c+1+r1c+1] >> 1;
 
-			if(r0c + r1c + 2 > 22) gr_info->region2start = 576>>1;
+			/* max(r0c+r1c+2) = 15+7+2 = 24 */
+			if(r0c+1+r1c+1 > 22) gr_info->region2start = 576>>1;
 			else gr_info->region2start = bandInfo[sfreq].longIdx[r0c+1+r1c+1] >> 1;
 
 			gr_info->block_type = 0;
@@ -716,16 +717,6 @@ static int III_dequantize_sample(mpg123_handle *fr, real xr[SBLIMIT][SSLIMIT],in
 		int bv       = gr_info->big_values;
 		int region1  = gr_info->region1start;
 		int region2  = gr_info->region2start;
-		if(region1 > region2)
-		{
-			/*
-				That's not optimal: it fixes a segfault with fuzzed data, but also apparently triggers where it shouldn't, see bug 1641196.
-				The benefit of not crashing / having this security risk is bigger than these few frames of a lame-3.70 file that aren't audible anyway.
-				But still, I want to know if indeed this check or the old lame is at fault.
-			*/
-			error("You got some really nasty file there... region1>region2!");
-			return 1;
-		}
 		l3 = ((576>>1)-bv)>>1;   
 
 		/* we may lose the 'odd' bit here !! check this later again */
@@ -1933,8 +1924,10 @@ int do_layer3(mpg123_handle *fr)
 
 	for(gr=0;gr<granules;gr++)
 	{
-		ALIGNED(16) real hybridIn[2][SBLIMIT][SSLIMIT];
-		ALIGNED(16) real hybridOut[2][SSLIMIT][SBLIMIT];
+		/*  hybridIn[2][SBLIMIT][SSLIMIT] */
+		real (*hybridIn)[SBLIMIT][SSLIMIT] = fr->layer3.hybrid_in;
+		/*  hybridOut[2][SSLIMIT][SBLIMIT] */
+		real (*hybridOut)[SSLIMIT][SBLIMIT] = fr->layer3.hybrid_out;
 
 		{
 			struct gr_info_s *gr_info = &(sideinfo.ch[0].gr[gr]);
